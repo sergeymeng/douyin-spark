@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 project_dir="$(pwd)"
 if [[ ! -f config.json || ! -f auth.json ]]; then
-  echo '缺少 config.json 或 auth.json；先在本机运行 configure.py，再上传这两个文件。' >&2
+  echo '缺少 config.json 或 auth.json；先在电脑上运行 setup_web.py，保存后上传这两个文件。' >&2
   exit 1
 fi
 if ! command -v systemctl >/dev/null; then
