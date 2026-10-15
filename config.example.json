@@ -1,0 +1,9 @@
+{
+  "timezone": "Asia/Shanghai",
+  "send_time": "20:30",
+  "friends": ["这里填抖音聊天中的准确备注名"],
+  "message": {
+    "type": "text",
+    "value": "今天忙啥呢？"
+  }
+}
