@@ -8,7 +8,14 @@
 - 一台使用 systemd 的 Linux 服务器，装有 Python 3.10+、`python3-venv` 和 `sudo`。以下命令按 Ubuntu 22.04/24.04 写。
 - 服务器能访问 `douyin.com`。想从公网打开管理页，还需要一个 HTTPS 反向代理；只用 SSH 转发则不需要。
 
-安装前先把这个仓库下载到电脑。在项目目录运行：
+先在电脑上下载仓库：
+
+```bash
+git clone https://github.com/sergeymeng/douyin-spark.git
+cd douyin-spark
+```
+
+然后安装依赖，打开设置页：
 
 ```bash
 python3 -m venv .venv
@@ -27,13 +34,13 @@ python3 -m venv .venv
 
 ## 装到服务器
 
-下面把 `user@server` 换成自己的 SSH 用户名和地址，把 GitHub 地址换成实际仓库地址。先登录服务器，装好 Python，并把仓库克隆到自己的目录：
+下面把 `user@server` 换成自己的 SSH 用户名和地址。先登录服务器，装好 Python，并把仓库克隆到自己的目录：
 
 ```bash
 ssh user@server
 sudo apt update
 sudo apt install -y git python3 python3-venv python3-pip
-git clone https://github.com/USERNAME/douyin-spark.git ~/douyin-spark
+git clone https://github.com/sergeymeng/douyin-spark.git ~/douyin-spark
 exit
 ```
 
@@ -120,7 +127,3 @@ ssh user@server 'sudo systemctl restart douyin-spark-web.service'
 ```
 
 定时任务下次运行也会读取新的登录状态。每天发送前还有一次登录检查，失败会走 ntfy 通知。
-
-## 发到 GitHub
-
-仓库里放源码、`requirements.txt`、`deploy/` 和这份 README。`auth.json` 是抖音登录状态，`config.json` 有好友和消息内容，`data/` 有管理密码哈希、通知频道和发送记录；这些文件都在 `.gitignore` 里。提交前跑一次 `git status --short`，确认它们没进暂存区。
