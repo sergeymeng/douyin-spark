@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
-from spark import SparkError, _editor_text, open_friend, send_text
+from spark import (SparkError, _editor_text, open_friend, outgoing_count,
+                   send_text, sticker_message_ids, verify_after_reload)
 
 
 HTML = """
@@ -34,6 +36,31 @@ GROUP_HTML = """
 
 
 class BrowserTests(unittest.TestCase):
+    def test_sticker_verified_when_visible_message_count_stays_the_same(self):
+        def bubble(message_id):
+            return ("<div class='messageMessageBoxmessageBox'>"
+                    "<span class='messageMessageBoxisFromMe'></span>"
+                    "<img class='MessageItemEmojiimage' "
+                    f"src='https://example.com/fire.png?l={message_id}'>"
+                    "</div>")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(bubble("older-message"))
+                message = {"type": "sticker", "value": "续火花"}
+                before_count = outgoing_count(page, message)
+                before_ids = sticker_message_ids(page)
+                page.route("**/chat", lambda route: route.fulfill(
+                    body=bubble("new-message"), content_type="text/html"))
+                with patch("spark.wait_for_chat_login"), patch("spark.open_friend"):
+                    verify_after_reload(page, "小林", message, before_count, before_ids)
+                self.assertEqual(before_count, outgoing_count(page, message))
+                self.assertEqual({"new-message"}, sticker_message_ids(page))
+            finally:
+                browser.close()
+
     def test_exact_friend_selected_over_similar_name(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)

@@ -14,6 +14,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import Browser, Locator, Page, TimeoutError as PlaywrightTimeout, sync_playwright
@@ -407,7 +408,16 @@ def outgoing_count(page: Page, message: dict) -> int:
     return sum(value in text for text in outgoing.all_inner_texts())
 
 
-def verify_after_reload(page: Page, friend: str, message: dict, before: int) -> None:
+def sticker_message_ids(page: Page) -> set[str]:
+    sources = page.locator(f"{OUTGOING} .MessageItemEmojiimage").evaluate_all(
+        "nodes => nodes.map(node => node.getAttribute('src')).filter(Boolean)"
+    )
+    return {message_id for source in sources
+            if (message_id := parse_qs(urlsplit(source).query).get("l", [""])[0])}
+
+
+def verify_after_reload(page: Page, friend: str, message: dict, before: int,
+                        before_sticker_ids: set[str]) -> None:
     # A new bubble can appear before Douyin accepts it. Read the chat again from
     # the server before recording a successful send.
     page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
@@ -417,7 +427,9 @@ def verify_after_reload(page: Page, friend: str, message: dict, before: int) -> 
     deadline = time.monotonic() + 8
     found_at: float | None = None
     while time.monotonic() < deadline:
-        if outgoing_count(page, message) > before:
+        new_sticker = (message["type"] == "sticker"
+                       and bool(sticker_message_ids(page) - before_sticker_ids))
+        if new_sticker or outgoing_count(page, message) > before:
             found_at = found_at or time.monotonic()
             if time.monotonic() - found_at >= 1:
                 return
@@ -456,11 +468,14 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
                             claimed = True
                             message = config["message"]
                             before = outgoing_count(page, message)
+                            before_sticker_ids = (sticker_message_ids(page)
+                                                  if message["type"] == "sticker" else set())
                             if message["type"] == "text":
                                 send_text(page, message["value"])
                             else:
                                 send_sticker(page, message["value"])
-                            verify_after_reload(page, friend, message, before)
+                            verify_after_reload(page, friend, message, before,
+                                                before_sticker_ids)
                             ledger.mark(day, friend, "sent")
                             sent_count += 1
                             LOGGER.info("已发送：%s", friend)
