@@ -53,6 +53,10 @@ class SparkError(RuntimeError):
     pass
 
 
+class SendUnconfirmed(SparkError):
+    """The local chat view did not settle after the send action."""
+
+
 def validate_config(config: object) -> dict:
     if not isinstance(config, dict):
         raise SparkError("config.json 必须是 JSON 对象")
@@ -167,6 +171,18 @@ def wait_for_chat_login(page: Page, timeout_ms: int) -> None:
     raise SparkError("还没有进入抖音聊天页；请扫码登录并完成页面提示")
 
 
+def load_chat(page: Page, timeout_ms: int = 20000) -> None:
+    for attempt in range(2):
+        page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
+        try:
+            wait_for_chat_login(page, timeout_ms)
+            return
+        except SparkError:
+            if attempt or any_visible(page, LOGIN_PROMPTS + CHALLENGES):
+                raise
+            LOGGER.warning("聊天页尚未加载，重新打开一次")
+
+
 def _exact_name_in(row: Locator, name: str) -> bool:
     for selector in NAMES:
         nodes = row.locator(selector)
@@ -225,8 +241,7 @@ def open_friend(page: Page, name: str) -> None:
     search = first_visible(page, SEARCH)
     chat_list = page.locator(".conversationConversationListwrapper").first
     if chat_list.count() and not chat_list.is_visible():
-        page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
-        wait_for_chat_login(page, 20000)
+        load_chat(page)
         search = first_visible(page, SEARCH)
     matches = _matching_rows(page, CHAT_ROWS, name)
     if len(matches) != 1:
@@ -240,8 +255,7 @@ def open_friend(page: Page, name: str) -> None:
                 break
             page.wait_for_timeout(300)
         if len(matches) != 1:
-            page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
-            wait_for_chat_login(page, 20000)
+            load_chat(page)
             matches = _find_in_chat_list(page, name)
     if len(matches) != 1:
         raise SparkError(f"好友“{name}”匹配到 {len(matches)} 个聊天；请使用唯一备注名")
@@ -297,7 +311,7 @@ def _confirm_new(page: Page, expected: str | None) -> None:
             if time.monotonic() - found_at >= 2:
                 return
         page.wait_for_timeout(300)
-    raise SparkError("发送状态无法确认；今天不会自动重试，避免重复发消息")
+    raise SendUnconfirmed("页面未确认发送状态")
 
 
 def _editor_text(editor: Locator) -> str:
@@ -420,8 +434,7 @@ def verify_after_reload(page: Page, friend: str, message: dict, before: int,
                         before_sticker_ids: set[str]) -> None:
     # A new bubble can appear before Douyin accepts it. Read the chat again from
     # the server before recording a successful send.
-    page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
-    wait_for_chat_login(page, 20000)
+    load_chat(page)
     open_friend(page, friend)
     page.wait_for_timeout(1000)
     deadline = time.monotonic() + 8
@@ -439,6 +452,20 @@ def verify_after_reload(page: Page, friend: str, message: dict, before: int,
     raise SparkError("重新打开聊天后未找到新消息；今天不会自动重试")
 
 
+def send_and_verify(page: Page, friend: str, message: dict) -> None:
+    before = outgoing_count(page, message)
+    before_sticker_ids = (sticker_message_ids(page)
+                          if message["type"] == "sticker" else set())
+    try:
+        if message["type"] == "text":
+            send_text(page, message["value"])
+        else:
+            send_sticker(page, message["value"])
+    except SendUnconfirmed:
+        LOGGER.info("页面未确认发送状态，重新打开聊天核对：%s", friend)
+    verify_after_reload(page, friend, message, before, before_sticker_ids)
+
+
 def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
     if not auth.exists():
         raise SparkError("缺少 auth.json；先在本机运行 python configure.py 扫码登录")
@@ -450,8 +477,7 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
                 try:
                     context = browser.new_context(storage_state=str(auth), locale="zh-CN")
                     page = context.new_page()
-                    page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
-                    wait_for_chat_login(page, 20000)
+                    load_chat(page)
                     day = beijing_day()
                     errors = 0
                     sent_count = 0
@@ -466,16 +492,7 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
                                 LOGGER.info("今天已尝试过：%s，跳过", friend)
                                 continue
                             claimed = True
-                            message = config["message"]
-                            before = outgoing_count(page, message)
-                            before_sticker_ids = (sticker_message_ids(page)
-                                                  if message["type"] == "sticker" else set())
-                            if message["type"] == "text":
-                                send_text(page, message["value"])
-                            else:
-                                send_sticker(page, message["value"])
-                            verify_after_reload(page, friend, message, before,
-                                                before_sticker_ids)
+                            send_and_verify(page, friend, config["message"])
                             ledger.mark(day, friend, "sent")
                             sent_count += 1
                             LOGGER.info("已发送：%s", friend)

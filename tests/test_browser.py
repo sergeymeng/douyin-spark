@@ -3,8 +3,9 @@ from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
-from spark import (SparkError, _editor_text, open_friend, outgoing_count,
-                   send_text, sticker_message_ids, verify_after_reload)
+from spark import (SendUnconfirmed, SparkError, _editor_text, load_chat,
+                   open_friend, outgoing_count, send_and_verify, send_text,
+                   sticker_message_ids, verify_after_reload)
 
 
 HTML = """
@@ -36,6 +37,49 @@ GROUP_HTML = """
 
 
 class BrowserTests(unittest.TestCase):
+    def test_empty_chat_shell_gets_one_reload(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                loads = []
+
+                def serve_chat(route):
+                    loads.append(1)
+                    body = ("<main>抖音聊天</main>" if len(loads) == 1 else
+                            "<input placeholder='搜索好友'>"
+                            "<div class='conversationConversationItemtitle'>小林</div>")
+                    route.fulfill(body=body, content_type="text/html; charset=utf-8")
+
+                page.route("**/chat", serve_chat)
+                load_chat(page, timeout_ms=1500)
+                self.assertEqual(2, len(loads))
+                self.assertTrue(page.locator("input[placeholder='搜索好友']").is_visible())
+            finally:
+                browser.close()
+
+    def test_local_confirmation_timeout_uses_reloaded_message_id(self):
+        def bubble(message_id):
+            return ("<div class='messageMessageBoxmessageBox'>"
+                    "<span class='messageMessageBoxisFromMe'></span>"
+                    "<img class='MessageItemEmojiimage' "
+                    f"src='https://example.com/fire.png?l={message_id}'>"
+                    "</div>")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page()
+                page.set_content(bubble("older-message"))
+                page.route("**/chat", lambda route: route.fulfill(
+                    body=bubble("new-message"), content_type="text/html"))
+                with patch("spark.send_sticker", side_effect=SendUnconfirmed), \
+                     patch("spark.wait_for_chat_login"), patch("spark.open_friend"):
+                    send_and_verify(page, "小林", {"type": "sticker", "value": "续火花"})
+                    self.assertEqual({"new-message"}, sticker_message_ids(page))
+            finally:
+                browser.close()
+
     def test_sticker_verified_when_visible_message_count_stays_the_same(self):
         def bubble(message_id):
             return ("<div class='messageMessageBoxmessageBox'>"
