@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import os
+import sys
 import argparse
 import base64
 import getpass
@@ -689,6 +690,11 @@ def main() -> None:
     STATE.serve = args.serve
     if args.serve and admin_mode() != "password":
         raise ValueError("公网设置页需要密码；先运行 python setup_web.py --set-admin-password")
+    if args.serve:
+        sys.modules.setdefault("setup_web", sys.modules[__name__])
+        from dashboard import serve
+        serve(args.listen_host, args.port)
+        return
     STATE.prefill = prefill_from_config()
     if args.prefill:
         STATE.prefill = json.loads(args.prefill.read_text(encoding="utf-8"))

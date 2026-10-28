@@ -16,6 +16,7 @@ LABELS = {
     "daily": "每天 03:30 发送",
     "supplement": "10 月 16 日 07:00 补发",
     "check": "登录状态检查",
+    "accounts": "多账号定时发送",
     "test": "通知测试",
     "success": "发送完成",
 }
@@ -36,7 +37,7 @@ def configured_url() -> str:
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def publish(kind: str, count: int = 0) -> bool:
+def publish(kind: str, count: int = 0, account: str = "") -> bool:
     url = configured_url()
     if not url:
         return False
@@ -44,9 +45,9 @@ def publish(kind: str, count: int = 0) -> bool:
     if kind == "test":
         body = "服务器通知已接通。"
     elif kind == "success":
-        body = f"抖音消息已发送给 {count} 位好友。"
+        body = f"{account or '抖音'}消息已发送给 {count} 位好友。"
     else:
-        body = f"抖音{LABELS[kind]}失败。请检查是否需要重新登录，并查看服务器日志。"
+        body = f"{account or '抖音'}{LABELS[kind]}失败。请检查是否需要重新登录，并查看服务器日志。"
     request = Request(
         url,
         data=body.encode("utf-8"),
@@ -69,5 +70,5 @@ def publish(kind: str, count: int = 0) -> bool:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in LABELS:
-        raise SystemExit("用法：python notify.py daily|supplement|check|test")
+        raise SystemExit("用法：python notify.py daily|supplement|check|accounts|test")
     publish(sys.argv[1])

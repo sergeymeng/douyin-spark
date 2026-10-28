@@ -180,6 +180,38 @@ Unit=douyin-spark-check.service
 WantedBy=timers.target
 EOF
 
+sudo tee /etc/systemd/system/douyin-spark-accounts.service >/dev/null <<EOF
+[Unit]
+Description=Send scheduled messages for additional Douyin accounts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$current_user
+WorkingDirectory=$project_dir
+Environment=HOME=$HOME
+ExecStart=$project_dir/.venv/bin/python $project_dir/scheduler.py
+TimeoutStartSec=3600
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+EOF
+
+sudo tee /etc/systemd/system/douyin-spark-accounts.timer >/dev/null <<EOF
+[Unit]
+Description=Check additional Douyin account schedules each minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+Persistent=false
+AccuracySec=1s
+Unit=douyin-spark-accounts.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
 sudo tee /etc/systemd/system/douyin-spark-web.service >/dev/null <<EOF
 [Unit]
 Description=Douyin spark settings page
@@ -207,6 +239,7 @@ sudo systemctl enable --now douyin-spark.timer
 sudo systemctl enable --now douyin-spark-reschedule.path
 sudo systemctl start douyin-spark-reschedule.service
 sudo systemctl enable --now douyin-spark-check.timer
+sudo systemctl enable --now douyin-spark-accounts.timer
 sudo systemctl enable --now douyin-spark-web.service
 echo "已设置北京时间每天 $send_time 执行。"
 echo "管理网页监听 ${web_host}:${web_port}。"

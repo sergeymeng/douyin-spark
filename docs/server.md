@@ -33,12 +33,12 @@ SPARK_WEB_HOST=172.21.0.1 bash deploy/install.sh
 ## 查运行状态
 
 ```bash
-systemctl is-active douyin-spark.timer douyin-spark-web.service douyin-spark-reschedule.path douyin-spark-check.timer
+systemctl is-active douyin-spark.timer douyin-spark-web.service douyin-spark-reschedule.path douyin-spark-check.timer douyin-spark-accounts.timer
 systemctl list-timers 'douyin-spark*' --no-pager
 journalctl -u douyin-spark.service -n 80 --no-pager
 ```
 
-四个服务应显示 `active`。定时器列表可能按服务器时区显示，设置页里的发送时间始终按北京时间保存。
+这五项应显示 `active`。定时器列表可能按服务器时区显示，设置页里的发送时间始终按北京时间保存。
 
 ## 重设管理页密码
 
@@ -53,17 +53,6 @@ cd ~/douyin-spark
 
 ## 抖音需要重新扫码
 
-在电脑的项目目录重新运行 `setup_web.py`，扫码并保存：
+打开管理页，选中账号，点“检查登录”。如果登录失效，点“重新登录”，用抖音扫一扫并在手机上确认。页面显示“已登录”后，好友和表情列表会更新。原账号的发送设置会保留。
 
-```bash
-.venv/bin/python setup_web.py
-```
-
-把新的登录状态传到服务器：
-
-```bash
-scp auth.json user@server:~/douyin-spark/auth.json
-ssh user@server 'sudo systemctl restart douyin-spark-web.service'
-```
-
-下次定时任务会读取新的登录状态。
+添加其他抖音号时，先填一个区分账号的名称，扫码登录，再选好友、时间和内容并保存。每个账号的登录文件和发送记录分别放在 `data/accounts/` 下；原账号仍使用项目根目录的 `auth.json` 和 `config.json`。新账号可以在管理页暂停或启用定时发送。

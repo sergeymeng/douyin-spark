@@ -466,7 +466,8 @@ def send_and_verify(page: Page, friend: str, message: dict) -> None:
     verify_after_reload(page, friend, message, before, before_sticker_ids)
 
 
-def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
+def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
+        account_name: str = "") -> int:
     if not auth.exists():
         raise SparkError("缺少 auth.json；先在本机运行 python configure.py 扫码登录")
     with exclusive_run(data_dir):
@@ -513,7 +514,7 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool) -> int:
                     if not dry_run and not errors and sent_count:
                         try:
                             from notify import publish
-                            publish("success", sent_count)
+                            publish("success", sent_count, account_name)
                         except Exception as exc:
                             LOGGER.error("成功通知发送失败：%s", exc)
                     return 1 if errors else 0
