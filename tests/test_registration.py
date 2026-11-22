@@ -85,15 +85,41 @@ class RegistrationTests(unittest.TestCase):
         self.assertEqual("11:00", json.loads(config.read_text())["send_time"])
         self.assertTrue(accounts.get_account(own)["enabled"])
         self.assertFalse(accounts.get_account(other)["enabled"])
-        with patch.object(dashboard, "publish") as publish:
+        with patch.object(notify, "send_notice") as publish:
             self.request(alice, "notifications", token=csrf, account=own, notify_url="https://ntfy.sh/privatealice")
-            publish.assert_called_once_with("test", topic_file=directory / "notify_url")
+            self.assertEqual("https://ntfy.sh/privatealice", publish.call_args.args[0])
         self.assertNotIn("privatealice", self.request(bob, ""))
         self.request(alice, "logout", token=csrf)
         self.assertIn("注册新账号", self.request(alice, ""))
         with self.assertRaises(HTTPError):
             self.request(alice, "login", username="Alice", password="incorrect")
         self.assertIn("测试好友", self.request(alice, "login", username="ALICE", password="personal-pass"))
+
+    def test_optional_phone_setup_creates_stable_topic_before_sending_a_test(self):
+        alice, own, csrf = self.signup("alice")
+        _, _, directory = accounts.paths(own)
+        topic_file = directory / "notify_url"
+        page = self.request(alice, "")
+        self.assertIn("定时消息照常发", page)
+        self.assertIn("App Store", page)
+        self.assertIn("Google Play", page)
+        self.assertFalse(topic_file.exists())
+        with patch.object(notify, "send_notice") as send:
+            topic_url = None
+            for _ in range(2):
+                page = self.request(alice, "notifications", account=own, token=csrf, action="create")
+                if topic_url is None:
+                    topic_url = topic_file.read_text().strip()
+                self.assertEqual(topic_url, topic_file.read_text().strip())
+                self.assertIn(topic_url, page)
+                self.assertIn(f'readonly value="{topic_url.rsplit("/", 1)[1]}"', page)
+            send.assert_not_called()
+            self.request(alice, "notifications", account=own, token=csrf, action="test-current")
+            self.assertEqual(topic_url, send.call_args.args[0])
+            page = self.request(alice, "notifications", account=own, token=csrf, action="remove")
+            self.assertFalse(topic_file.exists())
+            self.assertNotIn(topic_url, page)
+            self.assertIn("手机提醒已关闭", page)
 
     def test_invalid_and_concurrent_duplicate_registrations(self):
         for username, password in (("ADMIN", "secure-pass"), ("a", "secure-pass"), ("user", "tiny")):

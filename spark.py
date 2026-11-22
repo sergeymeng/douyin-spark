@@ -17,7 +17,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
-from playwright.sync_api import Browser, Locator, Page, TimeoutError as PlaywrightTimeout, sync_playwright
+from reports import ACCOUNT_ACTION, Report
+from notify import finish
+
+from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout, sync_playwright
 
 
 ROOT = Path(__file__).resolve().parent
@@ -50,7 +53,9 @@ LOGGER = logging.getLogger("spark")
 
 
 class SparkError(RuntimeError):
-    pass
+    def __init__(self, message: str = "", *, reason: str = ""):
+        super().__init__(message)
+        self.reason = reason
 
 
 class SendUnconfirmed(SparkError):
@@ -130,6 +135,10 @@ class Ledger:
                 (status, datetime.now().astimezone().isoformat(), day, friend),
             )
 
+    def status(self, day: str, friend: str) -> str:
+        return self.conn.execute("SELECT status FROM sends WHERE day=? AND friend=?",
+                                 (day, friend)).fetchone()[0]
+
     def close(self) -> None:
         self.conn.close()
 
@@ -168,19 +177,26 @@ def wait_for_chat_login(page: Page, timeout_ms: int) -> None:
             if time.monotonic() - chat_visible_at >= 8:
                 return
         page.wait_for_timeout(500)
-    raise SparkError("还没有进入抖音聊天页；请扫码登录并完成页面提示")
+    if any_visible(page, CHALLENGES):
+        raise SparkError("抖音要求完成安全验证", reason="challenge")
+    if any_visible(page, LOGIN_PROMPTS):
+        raise SparkError("抖音要求重新登录", reason="login")
+    raise SparkError("聊天页未能打开", reason="unavailable")
 
 
 def load_chat(page: Page, timeout_ms: int = 20000) -> None:
     for attempt in range(2):
-        page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
         try:
+            page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
             wait_for_chat_login(page, timeout_ms)
             return
-        except SparkError:
-            if attempt or any_visible(page, LOGIN_PROMPTS + CHALLENGES):
+        except PlaywrightTimeout as exc:
+            if attempt:
+                raise SparkError("聊天页加载超时", reason="unavailable") from exc
+        except SparkError as exc:
+            if attempt or exc.reason in ACCOUNT_ACTION:
                 raise
-            LOGGER.warning("聊天页尚未加载，重新打开一次")
+        LOGGER.warning("聊天页尚未加载，重新打开一次")
 
 
 def _title_matches(title: str, name: str) -> bool:
@@ -256,11 +272,14 @@ def open_friend(page: Page, name: str) -> None:
             if stable >= 2:
                 break
             page.wait_for_timeout(300)
+        if len(matches) > 1:
+            raise SparkError(f"好友“{name}”匹配到多个聊天", reason="ambiguous")
         if len(matches) != 1:
             load_chat(page)
             matches = _find_in_chat_list(page, name)
     if len(matches) != 1:
-        raise SparkError(f"好友“{name}”匹配到 {len(matches)} 个聊天；请使用唯一备注名")
+        reason = "ambiguous" if len(matches) > 1 else "recipient"
+        raise SparkError(f"好友“{name}”未能唯一定位；请核对备注", reason=reason)
     row = matches[0]
     button = row.locator('[class*="SearchPanelitemchat_btn"]').first
     (button if button.count() and button.is_visible() else row).click()
@@ -278,7 +297,7 @@ def open_friend(page: Page, name: str) -> None:
                             first_visible(page, EDITORS, 3000)
                             return
         page.wait_for_timeout(300)
-    raise SparkError(f"无法确认当前聊天属于“{name}”，已停止发送")
+    raise SparkError(f"无法确认当前聊天属于“{name}”，已停止发送", reason="recipient")
 
 
 def _visible_inside(scope: Locator, selectors: tuple[str, ...]) -> bool:
@@ -305,7 +324,7 @@ def _confirm_new(page: Page, expected: str | None) -> None:
             if expected is not None and expected not in bubble.inner_text(timeout=1000):
                 continue
             if _visible_inside(bubble, FAILURE):
-                raise SparkError("页面显示发送失败；今天不会自动重试")
+                raise SparkError("页面显示发送失败；今天不会自动重试", reason="rejected")
             if _visible_inside(bubble, PENDING):
                 found_at = None
                 break
@@ -322,12 +341,25 @@ def _editor_text(editor: Locator) -> str:
     ).strip()
 
 
+@contextmanager
+def sending():
+    """A failed click or subsequent wait may already have submitted the message."""
+    try:
+        yield
+    except SparkError as exc:
+        if not exc.reason:
+            exc.reason = "uncertain"
+        raise
+    except Exception as exc:
+        raise SparkError("发送动作未能确认", reason="uncertain") from exc
+
+
 def send_text(page: Page, value: str) -> None:
     editor = first_visible(page, EDITORS)
     tag = editor.evaluate("el => el.tagName.toLowerCase()")
     existing = editor.input_value().strip() if tag == "textarea" else _editor_text(editor)
     if existing or editor.locator("img").count():
-        raise SparkError("聊天输入框里有未发送的草稿；请先手动处理")
+        raise SparkError("聊天输入框里有未发送的草稿；请先手动处理", reason="draft")
     editor.click()
     if tag == "textarea":
         editor.fill(value)
@@ -335,16 +367,17 @@ def send_text(page: Page, value: str) -> None:
         page.keyboard.insert_text(value)
     entered = editor.input_value() if tag == "textarea" else _editor_text(editor)
     if value not in entered:
-        raise SparkError("文字没有进入聊天输入框")
+        raise SparkError("文字没有进入聊天输入框", reason="skipped")
     _mark_existing(page)
-    for selector in SEND_BUTTONS:
-        button = page.locator(selector).first
-        if button.count() and button.is_visible():
-            button.click()
-            break
-    else:
-        editor.press("Enter")
-    _confirm_new(page, value)
+    with sending():
+        for selector in SEND_BUTTONS:
+            button = page.locator(selector).first
+            if button.count() and button.is_visible():
+                button.click()
+                break
+        else:
+            editor.press("Enter")
+        _confirm_new(page, value)
 
 
 def sticker_names(page: Page) -> list[str]:
@@ -378,7 +411,7 @@ def sticker_names(page: Page) -> list[str]:
 def send_sticker(page: Page, name: str) -> None:
     editor = first_visible(page, EDITORS)
     if _editor_text(editor) or editor.locator("img").count():
-        raise SparkError("聊天输入框里有未发送的草稿；请先手动处理")
+        raise SparkError("聊天输入框里有未发送的草稿；请先手动处理", reason="draft")
     button = first_visible(page, STICKER_BUTTONS, 5000)
     button.click()
     panel = first_visible(page, STICKER_PANELS, 5000)
@@ -402,18 +435,19 @@ def send_sticker(page: Page, name: str) -> None:
         scroll.evaluate("(el, step) => { el.scrollTop += step }", max(100, viewport * 0.8))
         page.wait_for_timeout(250)
     if len(matching) != 1:
-        raise SparkError(f"表情“{name}”匹配到 {len(matching)} 项；请重新选择")
+        raise SparkError(f"表情“{name}”匹配到 {len(matching)} 项；请重新选择", reason="sticker")
     _mark_existing(page)
-    matching[0].click()
-    page.wait_for_timeout(1000)
-    if not page.locator(f"{OUTGOING}:not([data-spark-old])").count():
-        if editor.locator("img").count():
-            for selector in SEND_BUTTONS:
-                publish = page.locator(selector).first
-                if publish.count() and publish.is_visible():
-                    publish.click()
-                    break
-    _confirm_new(page, None)
+    with sending():
+        matching[0].click()
+        page.wait_for_timeout(1000)
+        if not page.locator(f"{OUTGOING}:not([data-spark-old])").count():
+            if editor.locator("img").count():
+                for selector in SEND_BUTTONS:
+                    publish = page.locator(selector).first
+                    if publish.count() and publish.is_visible():
+                        publish.click()
+                        break
+        _confirm_new(page, None)
 
 
 def outgoing_count(page: Page, message: dict) -> int:
@@ -455,86 +489,112 @@ def verify_after_reload(page: Page, friend: str, message: dict, before: int,
 
 
 def submit_message(page: Page, friend: str, message: dict) -> tuple[int, set[str]]:
-    before = outgoing_count(page, message)
-    before_sticker_ids = (sticker_message_ids(page)
-                          if message["type"] == "sticker" else set())
     try:
+        before = outgoing_count(page, message)
+        before_sticker_ids = (sticker_message_ids(page)
+                              if message["type"] == "sticker" else set())
         if message["type"] == "text":
             send_text(page, message["value"])
         else:
             send_sticker(page, message["value"])
     except SendUnconfirmed:
         LOGGER.info("页面未确认发送状态，重新打开聊天核对：%s", friend)
+    except SparkError as exc:
+        if not exc.reason:
+            exc.reason = "skipped"
+        raise
+    except Exception as exc:
+        raise SparkError("提交前未能准备消息", reason="skipped") from exc
     return before, before_sticker_ids
 
 
 def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
         account_name: str = "", *, topic_file: Path | None = None) -> int:
-    if not auth.exists():
-        raise SparkError("缺少 auth.json；先在本机运行 python configure.py 扫码登录")
+    report = Report.start(config, dry_run, account_name)
     with exclusive_run(data_dir):
-        ledger = Ledger(data_dir / "sends.sqlite3")
         try:
-            with sync_playwright() as playwright:
-                browser: Browser = playwright.chromium.launch(headless=True)
-                try:
-                    context = browser.new_context(storage_state=str(auth), locale="zh-CN")
-                    page = context.new_page()
-                    load_chat(page)
-                    day = beijing_day()
-                    errors = 0
-                    sent_count = 0
-                    pending: list[tuple[str, int, set[str]]] = []
-                    for friend in config["friends"]:
-                        claimed = False
-                        try:
-                            open_friend(page, friend)
-                            if dry_run:
-                                LOGGER.info("检查通过：%s", friend)
-                                continue
-                            if not ledger.claim(day, friend):
-                                LOGGER.info("今天已尝试过：%s，跳过", friend)
-                                continue
-                            claimed = True
-                            LOGGER.info("开始提交消息：%s", friend)
-                            before, ids = submit_message(page, friend, config["message"])
-                            pending.append((friend, before, ids))
-                        except Exception as exc:
-                            errors += 1
-                            LOGGER.error("%s：%s", friend, exc)
-                            if claimed:
-                                ledger.mark(day, friend, "uncertain")
-                    # Reload confirmations can be slow. Submit the remaining friends first.
-                    for friend, before, ids in pending:
-                        try:
-                            verify_after_reload(page, friend, config["message"], before, ids)
-                            ledger.mark(day, friend, "sent")
-                            sent_count += 1
-                            LOGGER.info("已确认发送：%s", friend)
-                        except Exception as exc:
-                            errors += 1
+            result = _run_chats(config, auth, data_dir, dry_run, report)
+        except Exception as exc:
+            LOGGER.exception("任务未能完成")
+            reason = getattr(exc, "reason", "") or "internal"
+            report.problem = reason
+            if reason in ACCOUNT_ACTION:
+                report.access = reason
+            result = 1
+        # Interactive setup uses --dry-run too. Only scheduled checks send alerts.
+        if not dry_run or report.invocation:
+            try:
+                finish(report, data_dir, topic_file)
+            except Exception:
+                LOGGER.exception("通知处理失败")
+                return 1
+        return result
+
+
+def _run_chats(config: dict, auth: Path, data_dir: Path, dry_run: bool, report: Report) -> int:
+    if not auth.exists():
+        raise SparkError("缺少登录文件", reason="login")
+    ledger = Ledger(data_dir / "sends.sqlite3")
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(storage_state=str(auth), locale="zh-CN")
+                page = context.new_page()
+                load_chat(page)
+                report.access = "ok"
+                day = report.started[:10]
+                errors = 0
+                pending: list[tuple[str, int, set[str]]] = []
+                for friend in config["friends"]:
+                    claimed = False
+                    try:
+                        open_friend(page, friend)
+                        if dry_run:
+                            report.results[friend] = "checked"
+                            LOGGER.info("检查通过：%s", friend)
+                            continue
+                        if not ledger.claim(day, friend):
+                            report.results[friend] = ("previous_sent" if ledger.status(day, friend) == "sent"
+                                                      else "previous_attempt")
+                            continue
+                        claimed = True
+                        report.results[friend] = "uncertain"
+                        LOGGER.info("开始提交消息：%s", friend)
+                        before, ids = submit_message(page, friend, config["message"])
+                        pending.append((friend, before, ids))
+                    except Exception as exc:
+                        reason = getattr(exc, "reason", "")
+                        if reason in ACCOUNT_ACTION:
+                            report.access = reason
+                        report.results[friend] = reason or ("uncertain" if claimed else "skipped")
+                        LOGGER.error("%s：%s", friend, exc)
+                        errors += 1
+                        if claimed:
                             ledger.mark(day, friend, "uncertain")
-                            LOGGER.error("%s：%s", friend, exc)
-                    if dry_run and not errors and config["message"]["type"] == "sticker":
-                        sticker = config["message"]["value"]
-                        if sticker not in sticker_names(page):
-                            LOGGER.error("抖音表情“%s”当前不可用", sticker)
-                            errors += 1
-                        else:
-                            LOGGER.info("表情可用：%s", sticker)
-                    context.storage_state(path=str(auth))
-                    auth.chmod(0o600)
-                    if not dry_run and not errors and sent_count:
-                        try:
-                            from notify import publish
-                            publish("success", sent_count, account_name, topic_file=topic_file)
-                        except Exception as exc:
-                            LOGGER.error("成功通知发送失败：%s", exc)
-                    return 1 if errors else 0
-                finally:
-                    browser.close()
-        finally:
-            ledger.close()
+                for friend, before, ids in pending:
+                    try:
+                        verify_after_reload(page, friend, config["message"], before, ids)
+                        ledger.mark(day, friend, "sent")
+                        report.results[friend] = "sent"
+                        LOGGER.info("已确认发送：%s", friend)
+                    except Exception as exc:
+                        errors += 1
+                        if getattr(exc, "reason", "") in ACCOUNT_ACTION:
+                            report.access = exc.reason
+                        ledger.mark(day, friend, "uncertain")
+                        LOGGER.error("%s：%s", friend, exc)
+                if dry_run and not errors and config["message"]["type"] == "sticker":
+                    if config["message"]["value"] not in sticker_names(page):
+                        report.problem = "sticker"
+                        errors += 1
+                context.storage_state(path=str(auth))
+                auth.chmod(0o600)
+                return 1 if errors else 0
+            finally:
+                browser.close()
+    finally:
+        ledger.close()
 
 
 def main() -> int:

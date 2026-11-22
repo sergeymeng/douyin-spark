@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import json
 import secrets
-import tempfile
 import threading
 import time
 import webbrowser
@@ -25,7 +24,7 @@ from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import sync_playwright
 
 from configure import collect_chat_names, write_private_json
-from notify import configured_url, publish, validate_url
+from notify import configure_channel, configured_url
 from spark import CHAT_URL, ROOT, open_friend, sticker_names, validate_config, wait_for_chat_login
 
 
@@ -181,7 +180,10 @@ footer{padding:20px 28px;display:flex;align-items:center;gap:14px}.save{border:0
 .login input{display:block;width:100%;height:42px;margin-top:6px;border:1px solid #d7d7d3;border-radius:6px;padding:0 11px;outline:none}
 .login input:focus{border-color:#555}.login .save{width:100%;margin-top:5px}
 .login-actions{display:flex;align-items:center;gap:16px}.login-actions .save{width:auto}.plain{border:0;background:none;color:#555;text-decoration:underline;text-underline-offset:3px;padding:0}
-.notify-actions{display:flex;gap:16px;align-items:center;margin-top:16px}.notify-actions .save{padding:9px 16px}
+.topic-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.topic-row input{flex:1;min-width:12ch;width:100%;padding:8px;border:1px solid #d7d7d3;border-radius:6px}
+.topic-copy{padding:8px 12px;border:1px solid #d7d7d3;border-radius:6px;background:#fff}
+.topic-url{display:block;overflow-wrap:anywhere;color:#555;margin-top:6px}.custom-topic{margin-top:20px}.custom-topic button{margin-top:10px}
+.notification-form a{color:#23557a}.notify-actions{display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-top:16px}.notify-actions .save{padding:9px 16px}
 .notice{margin:0 0 15px;padding:10px 12px;background:#eff6ef;border:1px solid #c9ddc9;border-radius:6px;color:#285b32}
 .header-actions{display:flex;align-items:center;gap:18px}.logout{border:0;background:none;padding:0}.logout button{border:0;background:none;color:#777;font-size:13px;padding:0}
 @media(max-width:600px){.page{margin:25px auto;padding:0 12px}header{padding:0 4px}header p{font-size:12px}section{padding:20px 16px}footer{padding:18px 16px}.friend-list{grid-template-columns:1fr;max-height:none;overflow:visible}.friend:nth-child(odd){border-right:0}.when{flex-wrap:wrap}}
@@ -269,9 +271,41 @@ setInterval(refreshData, 5 * 60 * 1000);
 """
 
 
-def render_login(error: str = "") -> str:
+def notification_fields(url: str) -> str:
+    stores = ('<a href="https://apps.apple.com/app/id1625396347" target="_blank" rel="noreferrer">App Store</a>'
+              ' · <a href="https://play.google.com/store/apps/details?id=io.heckel.ntfy" target="_blank" rel="noreferrer">Google Play</a>'
+              ' · <a href="https://f-droid.org/packages/io.heckel.ntfy/" target="_blank" rel="noreferrer">F-Droid</a>')
+    if url:
+        topic = html.escape(url.rsplit("/", 1)[-1], quote=True)
+        subscribe = f"""<p>打开 ntfy，点「＋」添加订阅。服务器用默认的 <code>https://ntfy.sh</code>，在「主题名称」里粘贴下面的频道名，再点「订阅」。</p>
+        <label class="field" for="ntfy-topic">你的频道名</label>
+        <div class="topic-row"><input id="ntfy-topic" readonly value="{topic}" onclick="this.select()">
+        <button class="topic-copy" type="button" id="copy-topic">复制频道名</button></div>
+        <small class="topic-url">完整地址：{html.escape(url)}</small>
+        <p>订阅好以后，发一条测试提醒，看看手机能不能收到。</p>
+        <div class="notify-actions"><button class="save" name="action" value="test-current" formnovalidate>发一条测试提醒</button>
+        <button class="plain" name="action" value="remove" formnovalidate>关闭手机提醒</button></div>
+        <script>
+        document.getElementById('copy-topic').addEventListener('click', async function() {{
+          const input = document.getElementById('ntfy-topic');
+          try {{ await navigator.clipboard.writeText(input.value); this.textContent = '已复制'; }}
+          catch {{ input.focus(); input.select(); this.textContent = '请手动复制'; }}
+        }});
+        </script>"""
+    else:
+        subscribe = """<p>装好后，先在这里生成频道，再把频道名填进 ntfy。</p>
+        <button class="save" name="action" value="create" formnovalidate>生成我的频道</button>"""
+    return f"""<div class="section-head"><h2>手机提醒</h2><span class="hint">可选</span></div>
+    <p>想在手机上看消息发没发成功，可以装 ntfy。不装也没关系，定时消息照常发。</p>
+    <p>下载 ntfy：{stores}</p>{subscribe}
+    <details class="custom-topic"><summary>使用已有频道</summary>
+    <label class="field">频道地址<input type="url" name="notify_url" placeholder="https://ntfy.sh/你的频道" autocomplete="off"></label>
+    <button class="plain" name="action" value="test">保存并测试</button></details>"""
+
+
+def render_login(error: str = "", action: str = "login") -> str:
     signup = '<p><a href="register">注册新账号</a></p>' if STATE.serve else ""
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 定时发送</title><style>{STYLE}</style></head><body><main class="login-page"><h1>定时发送</h1><form class="login" method="post" action="login"><label>账号<input name="username" autocomplete="username" autofocus required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<button class="save" type="submit">登录</button></form>{signup}</main></body></html>"""
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 定时发送</title><style>{STYLE}</style></head><body><main class="login-page"><h1>定时发送</h1><form class="login" method="post" action="{html.escape(action, quote=True)}"><label>账号<input name="username" autocomplete="username" autofocus required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<button class="save" type="submit">登录</button></form>{signup}</main></body></html>"""
 
 
 def render_first_run(error: str = "") -> str:
@@ -340,10 +374,7 @@ def render_page() -> str:
         <form method="post" action="notifications" class="notification-form">
           <input type="hidden" name="token" value="{STATE.token}">
           <section>
-            <div class="section-head"><h2>通知</h2><span class="hint">ntfy</span></div>
-            <label class="field">频道地址<input type="url" name="notify_url" value="{html.escape(configured_url(), quote=True)}" placeholder="https://ntfy.sh/你的频道" autocomplete="off"></label>
-            <p class="hint">留空会生成新地址。手机 ntfy 应用订阅同一个频道；发送成功或出错时会推送。</p>
-            <div class="notify-actions"><button class="save" type="submit" name="action" value="test">保存并测试</button><button class="plain" type="submit" name="action" value="remove" formnovalidate>取消绑定</button></div>
+            {notification_fields(configured_url())}
           </section>
         </form>
         <script>{SCRIPT}</script>
@@ -401,6 +432,9 @@ class Handler(BaseHTTPRequestHandler):
     def authenticated(self) -> bool:
         return (not STATE.serve and admin_mode() == "none") or self.session() is not None
 
+    def login_query(self) -> str:
+        return ""
+
     def issue_session(self, owner: str) -> None:
         token = secrets.token_urlsafe(32)
         now = time.time()
@@ -408,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE.sessions = {k: v for k, v in STATE.sessions.items() if v.expires > now}
             STATE.sessions[token] = Session(owner, now + SESSION_SECONDS, secrets.token_urlsafe(24))
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-        self.redirect("./", f"spark_login_v2={token}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
+        self.redirect("./" + self.login_query(), f"spark_login_v2={token}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
 
     def login_owner(self, username: str, password: str) -> str | None:
         return "admin" if username == "admin" and verify_admin("admin", password) else None
@@ -448,13 +482,13 @@ class Handler(BaseHTTPRequestHandler):
             failures = [stamp for stamp in STATE.failures.get(address, []) if now - stamp < 300]
             locked = len(failures) >= 5
         if locked:
-            self.respond(render_login("登录尝试太多，请五分钟后再试。"), status=429)
+            self.respond(render_login("登录尝试太多，请五分钟后再试。", "login" + self.login_query()), status=429)
             return
         owner = self.login_owner(username, password)
         if owner is None:
             with STATE.auth_lock:
                 STATE.failures.setdefault(address, []).append(now)
-            self.respond(render_login("账号或密码不对。"), status=401)
+            self.respond(render_login("账号或密码不对。", "login" + self.login_query()), status=401)
             return
         with STATE.auth_lock:
             STATE.failures.pop(address, None)
@@ -507,30 +541,10 @@ class Handler(BaseHTTPRequestHandler):
         path = ROOT / "data" / "notify_url"
         action = form.get("action", [""])[0]
         STATE.error = STATE.notice = ""
-        if action == "remove":
-            path.unlink(missing_ok=True)
-            STATE.notice = "已取消 ntfy 通知。"
-        elif action == "test":
-            try:
-                supplied = form.get("notify_url", [""])[0].strip()
-                url = validate_url(supplied or "https://ntfy.sh/douyin-spark-" + secrets.token_urlsafe(18))
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                                 prefix="notify-", delete=False) as temp:
-                    temp.write(url + "\n")
-                    temp_path = Path(temp.name)
-                try:
-                    temp_path.chmod(0o600)
-                    os.replace(temp_path, path)
-                finally:
-                    temp_path.unlink(missing_ok=True)
-                publish("test")
-                STATE.notice = "已绑定，测试通知已发送。"
-            except Exception as exc:
-                STATE.error = f"通知没有发出去：{exc}"
-        else:
-            self.send_error(400)
-            return
+        try:
+            STATE.notice = configure_channel(path, action, form.get("notify_url", [""])[0])
+        except ValueError as exc:
+            STATE.error = str(exc)
         self.respond(render_page(), status=400 if STATE.error else 200)
 
     def do_GET(self) -> None:
@@ -543,7 +557,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(render_first_run()) if url.path == "/" else self.redirect("./")
             return
         if url.path == "/login":
-            self.redirect("./") if self.authenticated() else self.respond(render_login())
+            self.redirect("./") if self.authenticated() else self.respond(render_login(action="login" + self.login_query()))
             return
         if not self.authenticated():
             if url.path == "/api/data":

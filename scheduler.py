@@ -68,11 +68,6 @@ def main() -> int:
         try:
             result = run(config, auth_path, directory, False, account["name"], topic_file=topic_file)
             errors += result
-            if result:
-                try:
-                    publish("accounts", account=account["name"], topic_file=topic_file)
-                except Exception:
-                    LOGGER.exception("失败通知没有发出：%s", account["name"])
         except Exception:
             LOGGER.exception("发送失败：%s", account["name"])
             errors += 1

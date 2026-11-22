@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import secrets
+import re
 import tempfile
 import threading
 import time
@@ -20,7 +21,8 @@ import setup_web
 from accounts import member_login, register
 from accounts import MAIN, add_account, beijing_now, get_account, list_accounts, paths, update_account
 from configure import collect_chat_names, write_private_json
-from notify import configured_url, publish, validate_url
+from reports import LABEL, Report, read_json
+from notify import configure_channel, configured_url
 from spark import (CHAT_URL, CHALLENGES, LOGIN_PROMPTS, SEARCH, SparkError,
                    any_visible, load_chat, open_friend, sticker_names, validate_config,
                    wait_for_chat_login)
@@ -175,7 +177,34 @@ def _prefill(config: dict) -> dict:
             "sticker": value if mode == "sticker" else ""}
 
 
-def render_dashboard(account_id: str, notice: str = "", *, csrf: str, admin: bool) -> str:
+def render_reports(directory: Path, report_id: str) -> str:
+    if report_id:
+        if not re.fullmatch("[a-f0-9]{32}", report_id):
+            raise ValueError("任务记录不存在")
+        selected = read_json(directory / "reports" / (report_id + ".json"))
+        if not selected:
+            raise ValueError("任务记录不存在")
+        records = [selected]
+    else:
+        records = [read_json(directory / f"report-{kind}.json") for kind in ("daily", "check")]
+    cards = []
+    for data in filter(None, records):
+        report = Report(**data)
+        if report.kind == "daily":
+            title, _, _ = report.summary()
+        else:
+            passed = sum(v == "checked" for v in report.results.values())
+            title = f"发送前检查 · {passed}/{len(report.results)} 位好友通过"
+        rows = "".join(f"<li>{html.escape(friend)} · {LABEL[code]}</li>"
+                       for friend, code in report.results.items())
+        issue = LABEL.get(report.problem, "") or LABEL.get(report.access, "")
+        cards.append(f'<section class="account-card"><h2>{html.escape(title)}</h2>'
+                     f'<p>{html.escape(report.started[:16].replace("T", " "))} 北京时间 {issue}</p>'
+                     f'<details {"open" if report_id else ""}><summary>逐人结果</summary><ul>{rows}</ul></details></section>')
+    return '<div id="run-report">' + "".join(cards) + '</div>' if cards else ""
+
+
+def render_dashboard(account_id: str, notice: str = "", *, csrf: str, admin: bool, report_id: str = "", notification_notice: bool = False) -> str:
     account = get_account(account_id)
     config_path, auth_path, _directory = paths(account_id)
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
@@ -200,8 +229,9 @@ def render_dashboard(account_id: str, notice: str = "", *, csrf: str, admin: boo
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>定时发送</title><style>{CSS}</style></head><body><main class="page">
     <header><h1>定时发送</h1><form class="logout" method="post" action="logout"><button type="submit">退出</button></form></header>
     {picker}
-    {f'<p class="notice">{html.escape(notice)}</p>' if notice else ''}
+    {f'<p class="notice">{html.escape(notice)}</p>' if notice and not notification_notice else ''}
     <div class="account-card"><h2>{html.escape(account["name"])}</h2><div class="status-row"><span class="status-text" id="login-status">{html.escape(status)}</span><button class="small-button" type="button" data-job="check">检查登录</button><button class="small-button" type="button" data-job="login">{"重新登录" if auth_path.exists() else "扫码绑定抖音号"}</button>{pause}</div><img class="qr" id="login-qr" alt="抖音登录二维码" hidden><p>仅绑定你本人的抖音号。扫码确认后，本站会在服务器保存网页登录状态，用于读取好友列表和按你的设置发送私信。</p></div>
+    {render_reports(_directory, report_id)}
     <form method="post" action="save"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}">
       <section><div class="section-head"><h2>好友</h2><span class="count" id="friend-count"></span></div><input class="search" id="friend-search" type="search" placeholder="搜索昵称" aria-label="搜索好友"><div class="friend-list">{friend_html}</div><label class="field">列表里没有？输入准确备注名<input name="other_friends" placeholder="多个名字用逗号隔开"></label></section>
       <section><div class="section-head"><h2>时间</h2><span class="hint">每天</span></div><div class="when"><input class="time" name="send_time" value="{html.escape(prefill.get("send_time", "20:30"), quote=True)}" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" required><span>北京时间</span></div></section>
@@ -214,7 +244,10 @@ def render_dashboard(account_id: str, notice: str = "", *, csrf: str, admin: boo
         <label class="field" data-for="emoji">选择表情<select name="emoji">{emoji_options}</select></label>
         <label class="field" data-for="sticker">选择抖音表情<select name="sticker">{sticker_options}</select></label></section>
       <footer><button class="save" type="submit">保存设置</button><span class="hint">保存后不会立即发送</span></footer></form>
-    <form class="notification-form" method="post" action="notifications"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}"><section><div class="section-head"><h2>通知</h2><span class="hint">ntfy</span></div><label class="field">频道地址<input type="url" name="notify_url" value="{html.escape(configured_url(topic_file), quote=True)}" placeholder="https://ntfy.sh/你的频道"></label><div class="notify-actions"><button class="save" type="submit" name="action" value="test">保存并测试</button><button class="plain" type="submit" name="action" value="remove">取消绑定</button></div></section></form>
+    <form id="notifications" class="notification-form" method="post" action="notifications"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}"><section>
+      {f'<p class="notice" role="status">{html.escape(notice)}</p>' if notification_notice and notice else ''}
+      {setup_web.notification_fields(configured_url(topic_file))}
+    </section></form>
     </main><script>
     const account = {json.dumps(account_id)};
     const token = {json.dumps(csrf)};
@@ -248,6 +281,18 @@ AUTH_SLOTS = threading.BoundedSemaphore(3)
 
 
 class Handler(setup_web.Handler):
+    def login_query(self) -> str:
+        fields = parse_qs(urlparse(self.path).query)
+        report = fields.get("report", [""])[0]
+        if not re.fullmatch("[a-f0-9]{32}", report):
+            return ""
+        query = {"report": report}
+        account = fields.get("a", [""])[0]
+        if re.fullmatch("[a-f0-9]{12}|main", account):
+            query["a"] = account
+        return "?" + urlencode(query)
+
+
     def login_owner(self, username: str, password: str) -> str | None:
         if username == "admin":
             return super().login_owner(username, password)
@@ -320,13 +365,15 @@ class Handler(setup_web.Handler):
             if url.path.startswith("/api/"):
                 self.respond_json({"error": "请先登录"}, status=401)
             else:
-                self.redirect("login")
+                self.redirect("login" + self.login_query())
             return
         try:
             account_id = self.authorized_account(session.owner, parse_qs(url.query).get("a", [None])[0])
             if url.path == "/":
                 notice = parse_qs(url.query).get("notice", [""])[0]
-                self.respond(render_dashboard(account_id, notice, csrf=session.csrf, admin=session.owner == "admin"))
+                self.respond(render_dashboard(account_id, notice, csrf=session.csrf, admin=session.owner == "admin",
+                                             report_id=parse_qs(url.query).get("report", [""])[0],
+                                             notification_notice="notifications" in parse_qs(url.query)))
             elif url.path == "/api/status":
                 job = JOBS.get(account_id)
                 self.respond_json(job.info() if job else {"state": "unknown"})
@@ -353,7 +400,7 @@ class Handler(setup_web.Handler):
         if self.headers.get("Sec-Fetch-Site") == "cross-site":
             self.send_error(403)
             return
-        if self.path in {"/login", "/register"}:
+        if urlparse(self.path).path in {"/login", "/register"}:
             if setup_web.admin_mode() != "password":
                 self.send_error(503)
                 return
@@ -361,7 +408,7 @@ class Handler(setup_web.Handler):
                 self.send_error(429)
                 return
             try:
-                if self.path == "/register":
+                if urlparse(self.path).path == "/register":
                     self.signup()
                 else:
                     self.login()
@@ -454,27 +501,9 @@ class Handler(setup_web.Handler):
     def save_notifications(self, account_id: str, form: dict[str, list[str]]) -> None:
         directory = paths(account_id)[2] if "credentials" in get_account(account_id) else setup_web.ROOT / "data"
         path = directory / "notify_url"
-        if form.get("action", [""])[0] == "remove":
-            path.unlink(missing_ok=True)
-            return self._back(account_id, "已取消 ntfy 通知。")
-        url = validate_url(form.get("notify_url", [""])[0].strip() or
-                           "https://ntfy.sh/douyin-spark-" + secrets.token_urlsafe(18))
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix="notify-", delete=False) as file:
-            file.write(url + "\n")
-            temp = Path(file.name)
-        try:
-            temp.chmod(0o600)
-            os.replace(temp, path)
-        finally:
-            temp.unlink(missing_ok=True)
-        try:
-            publish("test", topic_file=path)
-        except RuntimeError:
-            self._back(account_id, "频道已保存，测试通知发送失败。")
-            return
-        self._back(account_id, "通知已保存，测试消息已发送。")
+        message = configure_channel(path, form.get("action", ["test"])[0], form.get("notify_url", [""])[0])
+        query = urlencode({"a": account_id, "notifications": "1", "notice": message})
+        self.redirect("./?" + query + "#notifications")
 
 
 def serve(host: str, port: int) -> None:
