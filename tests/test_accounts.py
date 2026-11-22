@@ -59,14 +59,17 @@ class AccountsTests(unittest.TestCase):
                 other = accounts.add_account("工作号")
                 other_config = {**main_config, "friends": ["小陈"]}
                 accounts.paths(other["id"])[0].write_text(json.dumps(other_config))
-                first = dashboard.render_dashboard("main")
-                second = dashboard.render_dashboard(other["id"])
+                first = dashboard.render_dashboard("main", csrf="test", admin=True)
+                second = dashboard.render_dashboard(other["id"], csrf="test", admin=True)
                 self.assertIn('value="小林" checked', first)
                 self.assertNotIn('value="小陈"', first)
                 self.assertIn('value="小陈" checked', second)
                 self.assertNotIn('value="小林"', second)
                 self.assertIn("检查登录", first)
-                self.assertIn("重新登录", second)
+                self.assertIn("扫码绑定抖音号", second)
+                accounts.paths(other["id"])[1].write_text('{"cookies":[],"origins":[]}')
+                bound = dashboard.render_dashboard(other["id"], csrf="test", admin=True)
+                self.assertIn("重新登录", bound)
 
     def test_expired_login_check_reports_relogin(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -132,15 +135,15 @@ class AccountsTests(unittest.TestCase):
             try:
                 with patch.object(accounts, "ROOT", root), patch.object(accounts, "REGISTRY", root / "data" / "accounts.json"), \
                      patch.object(setup_web, "admin_mode", return_value="password"), \
-                     patch.object(setup_web.STATE, "sessions", {session: time.time() + 60}), \
+                     patch.object(setup_web.STATE, "sessions", {session: setup_web.Session("admin", time.time() + 60, "test-csrf")}), \
                      patch.object(setup_web.STATE, "serve", True):
                     with self.assertRaises(HTTPError) as error:
                         urlopen(base + "/api/status?a=main")
                     self.assertEqual(401, error.exception.code)
-                    headers = {"Cookie": f"spark_session={session}"}
+                    headers = {"Cookie": f"spark_login_v2={session}"}
                     with urlopen(Request(base + "/", headers=headers)) as response:
                         self.assertIn("添加账号", response.read().decode())
-                    body = urlencode({"token": setup_web.STATE.token, "name": "第二个号"}).encode()
+                    body = urlencode({"token": "test-csrf", "name": "第二个号"}).encode()
                     with urlopen(Request(base + "/add-account", data=body, headers=headers)) as response:
                         self.assertIn("第二个号", response.read().decode())
                     self.assertEqual(2, len(accounts.list_accounts()))

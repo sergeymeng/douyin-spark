@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +34,13 @@ ADMIN_PATH = ROOT / "data" / "admin_auth.json"
 SESSION_SECONDS = 12 * 60 * 60
 
 
+@dataclass(frozen=True)
+class Session:
+    owner: str
+    expires: float
+    csrf: str
+
+
 class SetupState:
     def __init__(self) -> None:
         self.token = secrets.token_urlsafe(24)
@@ -46,7 +54,7 @@ class SetupState:
         self.scan_lock = threading.Lock()
         self.admin: dict = {}
         self.admin_stamp = -1
-        self.sessions: dict[str, float] = {}
+        self.sessions: dict[str, Session] = {}
         self.failures: dict[str, list[float]] = {}
         self.auth_lock = threading.Lock()
         self.serve = False
@@ -262,7 +270,8 @@ setInterval(refreshData, 5 * 60 * 1000);
 
 
 def render_login(error: str = "") -> str:
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 定时发送</title><style>{STYLE}</style></head><body><main class="login-page"><h1>定时发送</h1><form class="login" method="post" action="login"><label>账号<input name="username" autocomplete="username" autofocus required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<button class="save" type="submit">登录</button></form></main></body></html>"""
+    signup = '<p><a href="register">注册新账号</a></p>' if STATE.serve else ""
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 定时发送</title><style>{STYLE}</style></head><body><main class="login-page"><h1>定时发送</h1><form class="login" method="post" action="login"><label>账号<input name="username" autocomplete="username" autofocus required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label>{f'<p class="error">{html.escape(error)}</p>' if error else ''}<button class="save" type="submit">登录</button></form>{signup}</main></body></html>"""
 
 
 def render_first_run(error: str = "") -> str:
@@ -376,23 +385,37 @@ class Handler(BaseHTTPRequestHandler):
             cookie.load(self.headers.get("Cookie", ""))
         except Exception:
             return ""
-        return cookie["spark_session"].value if "spark_session" in cookie else ""
+        return cookie["spark_login_v2"].value if "spark_login_v2" in cookie else ""
+
+    def session(self) -> Session | None:
+        if admin_mode() != "password":
+            return None
+        token = self.session_token()
+        with STATE.auth_lock:
+            session = STATE.sessions.get(token)
+            if session and session.expires > time.time():
+                return session
+            STATE.sessions.pop(token, None)
+        return None
 
     def authenticated(self) -> bool:
-        mode = admin_mode()
-        if mode == "none":
-            return not STATE.serve
-        if mode != "password":
-            return False
-        token = self.session_token()
-        if not token:
-            return False
+        return (not STATE.serve and admin_mode() == "none") or self.session() is not None
+
+    def issue_session(self, owner: str) -> None:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
         with STATE.auth_lock:
-            expires = STATE.sessions.get(token, 0)
-            if expires <= time.time():
-                STATE.sessions.pop(token, None)
-                return False
-            return True
+            STATE.sessions = {k: v for k, v in STATE.sessions.items() if v.expires > now}
+            STATE.sessions[token] = Session(owner, now + SESSION_SECONDS, secrets.token_urlsafe(24))
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        self.redirect("./", f"spark_login_v2={token}; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
+
+    def login_owner(self, username: str, password: str) -> str | None:
+        return "admin" if username == "admin" and verify_admin("admin", password) else None
+
+    def client_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "") if STATE.serve else ""
+        return forwarded.rsplit(",", 1)[-1].strip() if forwarded else self.client_address[0]
 
     def redirect(self, location: str, cookie: str = "") -> None:
         self.send_response(303)
@@ -417,27 +440,25 @@ class Handler(BaseHTTPRequestHandler):
         form = parse_qs(self.rfile.read(size).decode("utf-8", errors="replace"))
         username = form.get("username", [""])[0]
         password = form.get("password", [""])[0]
-        forwarded = self.headers.get("X-Forwarded-For", "") if STATE.serve else ""
-        address = forwarded.rsplit(",", 1)[-1].strip() if forwarded else self.client_address[0]
+        address = self.client_ip()
         now = time.time()
         with STATE.auth_lock:
+            STATE.failures = {ip: hits for ip, hits in STATE.failures.items()
+                              if hits and hits[-1] > now - 300}
             failures = [stamp for stamp in STATE.failures.get(address, []) if now - stamp < 300]
-            STATE.failures[address] = failures
             locked = len(failures) >= 5
         if locked:
             self.respond(render_login("登录尝试太多，请五分钟后再试。"), status=429)
             return
-        if not verify_admin(username, password):
+        owner = self.login_owner(username, password)
+        if owner is None:
             with STATE.auth_lock:
-                STATE.failures[address].append(now)
+                STATE.failures.setdefault(address, []).append(now)
             self.respond(render_login("账号或密码不对。"), status=401)
             return
-        token = secrets.token_urlsafe(32)
         with STATE.auth_lock:
-            STATE.sessions[token] = now + SESSION_SECONDS
             STATE.failures.pop(address, None)
-        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-        self.redirect("./", f"spark_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_SECONDS}{secure}")
+        self.issue_session(owner)
 
     def setup_auth(self) -> None:
         if STATE.serve or self.server.server_address[0] != "127.0.0.1" or admin_mode() != "unset":
@@ -561,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/logout":
             with STATE.auth_lock:
                 STATE.sessions.pop(self.session_token(), None)
-            self.redirect("login", "spark_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+            self.redirect("login", "spark_login_v2=; HttpOnly; SameSite=Strict; Max-Age=0")
             return
         if self.path == "/notifications":
             self.save_notifications()

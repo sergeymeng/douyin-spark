@@ -469,7 +469,7 @@ def submit_message(page: Page, friend: str, message: dict) -> tuple[int, set[str
 
 
 def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
-        account_name: str = "") -> int:
+        account_name: str = "", *, topic_file: Path | None = None) -> int:
     if not auth.exists():
         raise SparkError("缺少 auth.json；先在本机运行 python configure.py 扫码登录")
     with exclusive_run(data_dir):
@@ -527,7 +527,7 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
                     if not dry_run and not errors and sent_count:
                         try:
                             from notify import publish
-                            publish("success", sent_count, account_name)
+                            publish("success", sent_count, account_name, topic_file=topic_file)
                         except Exception as exc:
                             LOGGER.error("成功通知发送失败：%s", exc)
                     return 1 if errors else 0

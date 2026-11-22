@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -67,7 +69,36 @@ def _write_registry(accounts: list[dict]) -> None:
         temp.unlink(missing_ok=True)
 
 
-def add_account(name: str) -> dict:
+def password_digest(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**15, r=8, p=1,
+                          maxmem=128 * 1024 * 1024)
+
+
+def register(username: str, password: str) -> dict:
+    username = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,32}", username) or username == "admin":
+        raise ValueError("用户名需为 3 到 32 位字母、数字或下划线，且不能使用 admin")
+    if not 8 <= len(password) <= 128:
+        raise ValueError("密码需为 8 到 128 个字符")
+    salt = secrets.token_bytes(16)
+    credentials = {"username": username, "salt": salt.hex(),
+                   "digest": password_digest(password, salt).hex()}
+    return add_account(username, credentials=credentials)
+
+
+def member_login(username: str, password: str) -> str | None:
+    username = username.strip().lower()
+    account = next((a for a in list_accounts()
+                    if a.get("credentials", {}).get("username") == username), None)
+    record = account["credentials"] if account else {}
+    salt = bytes.fromhex(record.get("salt", "00" * 16))
+    digest = password_digest(password, salt)
+    if account and hmac.compare_digest(digest.hex(), record["digest"]):
+        return account["id"]
+    return None
+
+
+def add_account(name: str, *, credentials: dict | None = None) -> dict:
     name = name.strip()
     if not 1 <= len(name) <= 40:
         raise ValueError("账号名称填 1 到 40 个字")
@@ -75,6 +106,10 @@ def add_account(name: str) -> dict:
         accounts = list_accounts()
         account = {"id": secrets.token_hex(6), "name": name, "enabled": False,
                    "activated_at": beijing_now().isoformat()}
+        if credentials:
+            if any(a.get("credentials", {}).get("username") == credentials["username"] for a in accounts):
+                raise ValueError("这个用户名已被使用")
+            account["credentials"] = credentials
         accounts.append(account)
         directory = ROOT / "data" / "accounts" / account["id"]
         directory.mkdir(mode=0o700, parents=True, exist_ok=False)

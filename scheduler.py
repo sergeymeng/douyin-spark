@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from accounts import MAIN, beijing_now, list_accounts, paths
-from spark import load_config, run
+from spark import SparkError, load_config, run
 from notify import publish
 
 
@@ -53,25 +53,31 @@ def main() -> int:
         config_path, auth_path, directory = paths(account["id"])
         if not config_path.exists() or not auth_path.exists():
             continue
-        config = load_config(config_path)
+        try:
+            config = load_config(config_path)
+        except (SparkError, OSError):
+            LOGGER.exception("无法读取账号配置：%s", account["name"])
+            errors += 1
+            continue
         if not due(account, config["send_time"], now):
             continue
         if not claim_dispatch(directory, now.date().isoformat()):
             continue
+        topic_file = directory / "notify_url" if "credentials" in account else None
         LOGGER.info("开始发送：%s", account["name"])
         try:
-            result = run(config, auth_path, directory, False, account["name"])
+            result = run(config, auth_path, directory, False, account["name"], topic_file=topic_file)
             errors += result
             if result:
                 try:
-                    publish("accounts", account=account["name"])
+                    publish("accounts", account=account["name"], topic_file=topic_file)
                 except Exception:
                     LOGGER.exception("失败通知没有发出：%s", account["name"])
         except Exception:
             LOGGER.exception("发送失败：%s", account["name"])
             errors += 1
             try:
-                publish("accounts", account=account["name"])
+                publish("accounts", account=account["name"], topic_file=topic_file)
             except Exception:
                 LOGGER.exception("失败通知没有发出：%s", account["name"])
     return 1 if errors else 0

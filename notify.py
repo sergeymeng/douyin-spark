@@ -32,13 +32,13 @@ def validate_url(url: str) -> str:
     return url
 
 
-def configured_url() -> str:
-    path = ROOT / "data" / "notify_url"
+def configured_url(path: Path | None = None) -> str:
+    path = path or ROOT / "data" / "notify_url"
     return path.read_text(encoding="utf-8").strip() if path.exists() else ""
 
 
-def publish(kind: str, count: int = 0, account: str = "") -> bool:
-    url = configured_url()
+def publish(kind: str, count: int = 0, account: str = "", *, topic_file: Path | None = None) -> bool:
+    url = configured_url(topic_file)
     if not url:
         return False
     validate_url(url)

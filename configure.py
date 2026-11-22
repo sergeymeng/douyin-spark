@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -122,14 +123,16 @@ def choose_message(page, first_friend: str) -> dict:
 
 
 def write_private_json(path: Path, value: dict) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                     prefix=".settings-", delete=False) as file:
+        temp = Path(file.name)
+        try:
             json.dump(value, file, ensure_ascii=False, indent=2)
             file.write("\n")
-    finally:
-        os.chmod(path, 0o600)
+            file.close()
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
 
 
 def main() -> None:

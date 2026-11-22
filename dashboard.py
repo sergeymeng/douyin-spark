@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from playwright.sync_api import sync_playwright
 
 import setup_web
+from accounts import member_login, register
 from accounts import MAIN, add_account, beijing_now, get_account, list_accounts, paths, update_account
 from configure import collect_chat_names, write_private_json
 from notify import configured_url, publish, validate_url
@@ -140,6 +141,8 @@ def start_job(account_id: str, mode: str) -> AccountJob:
         current = JOBS.get(account_id)
         if current and current.thread.is_alive():
             return current
+        if sum(j.thread.is_alive() for j in JOBS.values()) >= 3:
+            raise ValueError("扫码服务正在使用中，请稍后再试")
         job = AccountJob(account_id, mode)
         JOBS[account_id] = job
         job.thread.start()
@@ -172,7 +175,7 @@ def _prefill(config: dict) -> dict:
             "sticker": value if mode == "sticker" else ""}
 
 
-def render_dashboard(account_id: str, notice: str = "") -> str:
+def render_dashboard(account_id: str, notice: str = "", *, csrf: str, admin: bool) -> str:
     account = get_account(account_id)
     config_path, auth_path, _directory = paths(account_id)
     config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.exists() else None
@@ -180,7 +183,7 @@ def render_dashboard(account_id: str, notice: str = "") -> str:
     cached_friends, stickers = CACHE.get(account_id, ([], []))
     friends = list(dict.fromkeys(cached_friends + prefill.get("friends", [])))
     selected = set(prefill.get("friends", []))
-    option_html = "".join(f'<option value="{a["id"]}" {"selected" if a["id"] == account_id else ""}>{html.escape(a["name"])}</option>' for a in list_accounts())
+    option_html = "".join(f'<option value="{a["id"]}" {"selected" if a["id"] == account_id else ""}>{html.escape(a["name"])}</option>' for a in list_accounts() if "credentials" not in a) if admin else ""
     friend_html = "".join(
         f'<label class="friend" data-name="{html.escape(name, quote=True)}"><input type="checkbox" name="friend" value="{html.escape(name, quote=True)}" {"checked" if name in selected else ""}><span title="{html.escape(name, quote=True)}">{html.escape(name)}</span></label>'
         for name in friends
@@ -191,13 +194,15 @@ def render_dashboard(account_id: str, notice: str = "") -> str:
     sticker_options = "".join(f'<option value="{html.escape(x, quote=True)}" {"selected" if x == prefill.get("sticker") else ""}>{html.escape(x)}</option>' for x in sticker_choices)
     job = JOBS.get(account_id)
     status = job.info()["message"] if job else ("登录状态尚未检查。" if auth_path.exists() else "还没登录。")
-    pause = "" if account_id == MAIN else f'''<form class="inline-form" method="post" action="toggle"><input type="hidden" name="token" value="{setup_web.STATE.token}"><input type="hidden" name="account" value="{account_id}"><button class="small-button" type="submit">{"暂停定时" if account["enabled"] else "启用定时"}</button></form>'''
+    pause = "" if account_id == MAIN else f'''<form class="inline-form" method="post" action="toggle"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}"><button class="small-button" type="submit">{"暂停定时" if account["enabled"] else "启用定时"}</button></form>'''
+    picker = f'''<div class="accounts"><select id="account-picker" aria-label="选择抖音账号">{option_html}</select><form method="post" action="add-account"><input type="hidden" name="token" value="{csrf}"><input name="name" maxlength="40" placeholder="新账号名称" required><button class="small-button" type="submit">添加账号</button></form></div>''' if admin else ""
+    topic_file = None if admin else _directory / "notify_url"
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>定时发送</title><style>{CSS}</style></head><body><main class="page">
     <header><h1>定时发送</h1><form class="logout" method="post" action="logout"><button type="submit">退出</button></form></header>
-    <div class="accounts"><select id="account-picker" aria-label="选择抖音账号">{option_html}</select><form method="post" action="add-account"><input type="hidden" name="token" value="{setup_web.STATE.token}"><input name="name" maxlength="40" placeholder="新账号名称" required><button class="small-button" type="submit">添加账号</button></form></div>
+    {picker}
     {f'<p class="notice">{html.escape(notice)}</p>' if notice else ''}
-    <div class="account-card"><h2>{html.escape(account["name"])}</h2><div class="status-row"><span class="status-text" id="login-status">{html.escape(status)}</span><button class="small-button" type="button" data-job="check">检查登录</button><button class="small-button" type="button" data-job="login">重新登录</button>{pause}</div><img class="qr" id="login-qr" alt="抖音登录二维码" hidden><p>扫码后在手机上确认。</p></div>
-    <form method="post" action="save"><input type="hidden" name="token" value="{setup_web.STATE.token}"><input type="hidden" name="account" value="{account_id}">
+    <div class="account-card"><h2>{html.escape(account["name"])}</h2><div class="status-row"><span class="status-text" id="login-status">{html.escape(status)}</span><button class="small-button" type="button" data-job="check">检查登录</button><button class="small-button" type="button" data-job="login">{"重新登录" if auth_path.exists() else "扫码绑定抖音号"}</button>{pause}</div><img class="qr" id="login-qr" alt="抖音登录二维码" hidden><p>仅绑定你本人的抖音号。扫码确认后，本站会在服务器保存网页登录状态，用于读取好友列表和按你的设置发送私信。</p></div>
+    <form method="post" action="save"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}">
       <section><div class="section-head"><h2>好友</h2><span class="count" id="friend-count"></span></div><input class="search" id="friend-search" type="search" placeholder="搜索昵称" aria-label="搜索好友"><div class="friend-list">{friend_html}</div><label class="field">列表里没有？输入准确备注名<input name="other_friends" placeholder="多个名字用逗号隔开"></label></section>
       <section><div class="section-head"><h2>时间</h2><span class="hint">每天</span></div><div class="when"><input class="time" name="send_time" value="{html.escape(prefill.get("send_time", "20:30"), quote=True)}" pattern="([01][0-9]|2[0-3]):[0-5][0-9]" placeholder="HH:MM" required><span>北京时间</span></div></section>
       <section><div class="section-head"><h2>内容</h2></div><div class="modes">
@@ -209,11 +214,11 @@ def render_dashboard(account_id: str, notice: str = "") -> str:
         <label class="field" data-for="emoji">选择表情<select name="emoji">{emoji_options}</select></label>
         <label class="field" data-for="sticker">选择抖音表情<select name="sticker">{sticker_options}</select></label></section>
       <footer><button class="save" type="submit">保存设置</button><span class="hint">保存后不会立即发送</span></footer></form>
-    <form class="notification-form" method="post" action="notifications"><input type="hidden" name="token" value="{setup_web.STATE.token}"><input type="hidden" name="account" value="{account_id}"><section><div class="section-head"><h2>通知</h2><span class="hint">ntfy</span></div><label class="field">频道地址<input type="url" name="notify_url" value="{html.escape(configured_url(), quote=True)}" placeholder="https://ntfy.sh/你的频道"></label><div class="notify-actions"><button class="save" type="submit" name="action" value="test">保存并测试</button><button class="plain" type="submit" name="action" value="remove">取消绑定</button></div></section></form>
+    <form class="notification-form" method="post" action="notifications"><input type="hidden" name="token" value="{csrf}"><input type="hidden" name="account" value="{account_id}"><section><div class="section-head"><h2>通知</h2><span class="hint">ntfy</span></div><label class="field">频道地址<input type="url" name="notify_url" value="{html.escape(configured_url(topic_file), quote=True)}" placeholder="https://ntfy.sh/你的频道"></label><div class="notify-actions"><button class="save" type="submit" name="action" value="test">保存并测试</button><button class="plain" type="submit" name="action" value="remove">取消绑定</button></div></section></form>
     </main><script>
     const account = {json.dumps(account_id)};
-    const token = {json.dumps(setup_web.STATE.token)};
-    document.querySelector('#account-picker').addEventListener('change', e => location.href = '?a=' + encodeURIComponent(e.target.value));
+    const token = {json.dumps(csrf)};
+    document.querySelector('#account-picker')?.addEventListener('change', e => location.href = '?a=' + encodeURIComponent(e.target.value));
     document.querySelector('#friend-search').addEventListener('input', e => {{const q=e.target.value.toLowerCase();document.querySelectorAll('.friend').forEach(x=>x.hidden=!x.dataset.name.toLowerCase().includes(q));}});
     function update() {{const count=document.querySelectorAll('input[name="friend"]:checked').length;document.querySelector('#friend-count').textContent='已选 '+count+' 人';const mode=document.querySelector('input[name="mode"]:checked')?.value;document.querySelectorAll('[data-for]').forEach(x=>x.hidden=x.dataset.for!==mode);}}
     document.querySelector('form[action="save"]').addEventListener('change',update);update();
@@ -223,20 +228,76 @@ def render_dashboard(account_id: str, notice: str = "") -> str:
     </script></body></html>'''
 
 
+def registration_page(error: str = "") -> str:
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1"><title>注册 · 定时发送</title>
+    <style>{setup_web.STYLE}</style></head><body><main class="login-page"><h1>注册定时发送账号</h1>
+    <p>注册后，用抖音扫码绑定自己的账号，即可设置每天给哪些好友发送消息。</p>
+    <form class="login" method="post" action="register">
+    <label>用户名<input name="username" autocomplete="username" required autofocus minlength="3" maxlength="32"
+    pattern="[A-Za-z0-9_]{{3,32}}" placeholder="3–32 位字母、数字或下划线"></label>
+    <label>密码<input name="password" type="password" autocomplete="new-password" minlength="8" maxlength="128" required></label>
+    <label>确认密码<input name="confirm" type="password" autocomplete="new-password" required></label>
+    {f'<p class="error">{html.escape(error)}</p>' if error else ''}
+    <button class="save" type="submit">注册并登录</button></form><p><a href="login">已有账号，去登录</a></p></main></body></html>"""
+
+
+SIGNUP_ATTEMPTS: dict[str, list[float]] = {}
+SIGNUP_LOCK = threading.Lock()
+AUTH_SLOTS = threading.BoundedSemaphore(3)
+
+
 class Handler(setup_web.Handler):
-    def _form(self) -> dict[str, list[str]]:
+    def login_owner(self, username: str, password: str) -> str | None:
+        if username == "admin":
+            return super().login_owner(username, password)
+        return member_login(username, password)
+
+    def signup(self) -> None:
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 4096:
+                raise ValueError("注册信息长度无效")
+            address = self.client_ip()
+            now = time.monotonic()
+            with SIGNUP_LOCK:
+                for key in list(SIGNUP_ATTEMPTS):
+                    if SIGNUP_ATTEMPTS[key][-1] <= now - 600:
+                        del SIGNUP_ATTEMPTS[key]
+                attempts = [t for t in SIGNUP_ATTEMPTS.get(address, []) if t > now - 600]
+                limited = len(attempts) >= 5
+                if not limited:
+                    SIGNUP_ATTEMPTS[address] = attempts + [now]
+            if limited:
+                self.respond(registration_page("注册尝试过多，请稍后再试。"), 429)
+                return
+            form = parse_qs(self.rfile.read(size).decode("utf-8"))
+            password = form.get("password", [""])[0]
+            if password != form.get("confirm", [""])[0]:
+                raise ValueError("两次密码不一致")
+            account = register(form.get("username", [""])[0], password)
+        except ValueError as exc:
+            self.respond(registration_page(str(exc)), 400)
+            return
+        self.issue_session(account["id"])
+
+    def authorized_account(self, owner: str, requested: str | None) -> str:
+        account_id = requested if requested is not None else (MAIN if owner == "admin" else owner)
+        if owner != "admin" and account_id != owner:
+            raise ValueError("账号不存在")
+        account = get_account(account_id)
+        if owner == "admin" and "credentials" in account:
+            raise ValueError("账号不存在")
+        return account_id
+
+    def _form(self, csrf: str) -> dict[str, list[str]]:
         size = int(self.headers.get("Content-Length", "0"))
         if not 0 <= size <= 10000:
             raise ValueError("表单太大")
         form = parse_qs(self.rfile.read(size).decode("utf-8"), keep_blank_values=True)
-        if form.get("token", [""])[0] != setup_web.STATE.token:
+        if form.get("token", [""])[0] != csrf:
             raise PermissionError("页面已过期，请刷新后重试")
         return form
-
-    def _account_id(self, form: dict | None = None) -> str:
-        if form is None:
-            return parse_qs(urlparse(self.path).query).get("a", [MAIN])[0]
-        return form.get("account", [MAIN])[0]
 
     def _back(self, account_id: str, message: str = "") -> None:
         query = {"a": account_id}
@@ -246,20 +307,26 @@ class Handler(setup_web.Handler):
 
     def do_GET(self) -> None:
         url = urlparse(self.path)
+        if url.path == "/register":
+            if self.authenticated():
+                self.redirect("./")
+            else:
+                self.respond(registration_page())
+            return
         if url.path == "/login":
             return super().do_GET()
-        if not self.authenticated():
+        session = self.session()
+        if not session:
             if url.path.startswith("/api/"):
                 self.respond_json({"error": "请先登录"}, status=401)
             else:
                 self.redirect("login")
             return
         try:
-            account_id = self._account_id()
-            get_account(account_id)
+            account_id = self.authorized_account(session.owner, parse_qs(url.query).get("a", [None])[0])
             if url.path == "/":
                 notice = parse_qs(url.query).get("notice", [""])[0]
-                self.respond(render_dashboard(account_id, notice))
+                self.respond(render_dashboard(account_id, notice, csrf=session.csrf, admin=session.owner == "admin"))
             elif url.path == "/api/status":
                 job = JOBS.get(account_id)
                 self.respond_json(job.info() if job else {"state": "unknown"})
@@ -280,18 +347,39 @@ class Handler(setup_web.Handler):
             else:
                 self.send_error(404)
         except ValueError as exc:
-            self.respond(str(exc), status=404)
+            self.respond(html.escape(str(exc)), status=404)
 
     def do_POST(self) -> None:
-        if self.path in {"/login", "/logout", "/setup-auth"}:
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            self.send_error(403)
+            return
+        if self.path in {"/login", "/register"}:
+            if setup_web.admin_mode() != "password":
+                self.send_error(503)
+                return
+            if not AUTH_SLOTS.acquire(blocking=False):
+                self.send_error(429)
+                return
+            try:
+                if self.path == "/register":
+                    self.signup()
+                else:
+                    self.login()
+            finally:
+                AUTH_SLOTS.release()
+            return
+        if self.path == "/logout":
             return super().do_POST()
-        if not self.authenticated():
+        session = self.session()
+        if not session:
             self.send_error(401)
             return
         try:
-            form = self._form()
-            account_id = self._account_id(form)
+            form = self._form(session.csrf)
+            account_id = self.authorized_account(session.owner, form.get("account", [None])[0])
             if self.path == "/add-account":
+                if session.owner != "admin":
+                    raise PermissionError("此账号已分配独立的抖音绑定位置")
                 account = add_account(form.get("name", [""])[0])
                 self._back(account["id"], "账号已添加，先扫码登录。")
             elif self.path == "/job":
@@ -315,9 +403,9 @@ class Handler(setup_web.Handler):
             else:
                 self.send_error(404)
         except PermissionError as exc:
-            self.respond(str(exc), status=403)
+            self.respond(html.escape(str(exc)), status=403)
         except (ValueError, SparkError) as exc:
-            self.respond(str(exc), status=400)
+            self.respond(html.escape(str(exc)), status=400)
 
     def save_account(self, account_id: str, form: dict[str, list[str]]) -> None:
         config_path, auth_path, _directory = paths(account_id)
@@ -359,12 +447,13 @@ class Handler(setup_web.Handler):
                     else:
                         config_path.unlink(missing_ok=True)
                     raise ValueError("定时器没有更新，设置未保存")
-        else:
+        elif old_config is None:
             update_account(account_id, enabled=True, activated_at=beijing_now().isoformat())
         self._back(account_id, "已保存，下次按这个时间发送。")
 
     def save_notifications(self, account_id: str, form: dict[str, list[str]]) -> None:
-        path = setup_web.ROOT / "data" / "notify_url"
+        directory = paths(account_id)[2] if "credentials" in get_account(account_id) else setup_web.ROOT / "data"
+        path = directory / "notify_url"
         if form.get("action", [""])[0] == "remove":
             path.unlink(missing_ok=True)
             return self._back(account_id, "已取消 ntfy 通知。")
@@ -380,7 +469,11 @@ class Handler(setup_web.Handler):
             os.replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
-        publish("test")
+        try:
+            publish("test", topic_file=path)
+        except RuntimeError:
+            self._back(account_id, "频道已保存，测试通知发送失败。")
+            return
         self._back(account_id, "通知已保存，测试消息已发送。")
 
 
