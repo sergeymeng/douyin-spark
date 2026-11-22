@@ -183,15 +183,6 @@ def load_chat(page: Page, timeout_ms: int = 20000) -> None:
             LOGGER.warning("聊天页尚未加载，重新打开一次")
 
 
-def _exact_name_in(row: Locator, name: str) -> bool:
-    for selector in NAMES:
-        nodes = row.locator(selector)
-        for index in range(min(nodes.count(), 8)):
-            if _title_matches(nodes.nth(index).inner_text(timeout=1000), name):
-                return True
-    return False
-
-
 def _title_matches(title: str, name: str) -> bool:
     title = title.strip()
     return title == name or re.sub(r"\s*\(\d+\)$", "", title) == name
@@ -200,8 +191,19 @@ def _title_matches(title: str, name: str) -> bool:
 def _matching_rows(page: Page, selectors: tuple[str, ...], name: str) -> list[Locator]:
     for selector in selectors:
         rows = page.locator(selector)
-        matches = [row for index in range(min(rows.count(), 100))
-                   if (row := rows.nth(index)).is_visible() and _exact_name_in(row, name)]
+        # Read the rendered names in one browser call, including nested search highlights.
+        names_by_row = rows.evaluate_all(
+            """(rows, selectors) => rows.slice(0, 100).map(row =>
+                selectors.flatMap(selector => Array.from(row.querySelectorAll(selector))
+                    .slice(0, 8).map(node => node.innerText)))""",
+            list(NAMES),
+        )
+        matches = []
+        for index, titles in enumerate(names_by_row):
+            if any(_title_matches(title, name) for title in titles):
+                row = rows.nth(index)
+                if row.is_visible():
+                    matches.append(row)
         if matches:
             return matches
     return []
@@ -452,7 +454,7 @@ def verify_after_reload(page: Page, friend: str, message: dict, before: int,
     raise SparkError("重新打开聊天后未找到新消息；今天不会自动重试")
 
 
-def send_and_verify(page: Page, friend: str, message: dict) -> None:
+def submit_message(page: Page, friend: str, message: dict) -> tuple[int, set[str]]:
     before = outgoing_count(page, message)
     before_sticker_ids = (sticker_message_ids(page)
                           if message["type"] == "sticker" else set())
@@ -463,7 +465,7 @@ def send_and_verify(page: Page, friend: str, message: dict) -> None:
             send_sticker(page, message["value"])
     except SendUnconfirmed:
         LOGGER.info("页面未确认发送状态，重新打开聊天核对：%s", friend)
-    verify_after_reload(page, friend, message, before, before_sticker_ids)
+    return before, before_sticker_ids
 
 
 def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
@@ -482,6 +484,7 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
                     day = beijing_day()
                     errors = 0
                     sent_count = 0
+                    pending: list[tuple[str, int, set[str]]] = []
                     for friend in config["friends"]:
                         claimed = False
                         try:
@@ -493,15 +496,25 @@ def run(config: dict, auth: Path, data_dir: Path, dry_run: bool,
                                 LOGGER.info("今天已尝试过：%s，跳过", friend)
                                 continue
                             claimed = True
-                            send_and_verify(page, friend, config["message"])
-                            ledger.mark(day, friend, "sent")
-                            sent_count += 1
-                            LOGGER.info("已发送：%s", friend)
+                            LOGGER.info("开始提交消息：%s", friend)
+                            before, ids = submit_message(page, friend, config["message"])
+                            pending.append((friend, before, ids))
                         except Exception as exc:
                             errors += 1
                             LOGGER.error("%s：%s", friend, exc)
                             if claimed:
                                 ledger.mark(day, friend, "uncertain")
+                    # Reload confirmations can be slow. Submit the remaining friends first.
+                    for friend, before, ids in pending:
+                        try:
+                            verify_after_reload(page, friend, config["message"], before, ids)
+                            ledger.mark(day, friend, "sent")
+                            sent_count += 1
+                            LOGGER.info("已确认发送：%s", friend)
+                        except Exception as exc:
+                            errors += 1
+                            ledger.mark(day, friend, "uncertain")
+                            LOGGER.error("%s：%s", friend, exc)
                     if dry_run and not errors and config["message"]["type"] == "sticker":
                         sticker = config["message"]["value"]
                         if sticker not in sticker_names(page):

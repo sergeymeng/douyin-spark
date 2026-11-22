@@ -1,9 +1,11 @@
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
-from spark import Ledger, SparkError, beijing_day, validate_config
+from spark import Ledger, SparkError, beijing_day, run, validate_config
 
 
 VALID = {
@@ -27,6 +29,37 @@ class CoreTests(unittest.TestCase):
         config = {**VALID, "send_time": "24:00"}
         with self.assertRaises(SparkError):
             validate_config(config)
+
+    def test_submits_all_friends_before_reload_checks_and_never_resends(self):
+        events = []
+
+        def submit(page, friend, message):
+            events.append(("submit", friend))
+            return 3, {friend}
+
+        def verify(page, friend, message, before, ids):
+            events.append(("verify", friend))
+            self.assertEqual((3, {friend}), (before, ids))
+            if friend == "小林":
+                raise SparkError("查不到回执")
+
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            auth = directory / "auth.json"
+            auth.write_text('{"cookies":[],"origins":[]}')
+            with patch("spark.load_chat"), patch("spark.open_friend"), \
+                 patch("spark.submit_message", side_effect=submit), \
+                 patch("spark.verify_after_reload", side_effect=verify):
+                self.assertEqual(1, run(VALID, auth, directory, False))
+                self.assertEqual(0, run(VALID, auth, directory, False))
+            self.assertEqual([("submit", "小林"), ("submit", "阿晴"),
+                              ("verify", "小林"), ("verify", "阿晴")], events)
+            db = sqlite3.connect(directory / "sends.sqlite3")
+            try:
+                self.assertEqual({"小林": "uncertain", "阿晴": "sent"},
+                                 dict(db.execute("SELECT friend, status FROM sends")))
+            finally:
+                db.close()
 
     def test_once_per_friend_per_day(self):
         with tempfile.TemporaryDirectory() as temp:

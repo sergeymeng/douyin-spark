@@ -90,7 +90,7 @@ Description=Run Douyin spark sender daily at $send_time Beijing time
 [Timer]
 OnCalendar=$timer_time
 Persistent=false
-AccuracySec=1min
+AccuracySec=1s
 Unit=douyin-spark.service
 
 [Install]

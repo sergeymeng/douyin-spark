@@ -4,7 +4,7 @@ from unittest.mock import patch
 from playwright.sync_api import sync_playwright
 
 from spark import (SendUnconfirmed, SparkError, _editor_text, load_chat,
-                   open_friend, outgoing_count, send_and_verify, send_text,
+                   open_friend, outgoing_count, submit_message, send_text,
                    sticker_message_ids, verify_after_reload)
 
 
@@ -75,7 +75,9 @@ class BrowserTests(unittest.TestCase):
                     body=bubble("new-message"), content_type="text/html"))
                 with patch("spark.send_sticker", side_effect=SendUnconfirmed), \
                      patch("spark.wait_for_chat_login"), patch("spark.open_friend"):
-                    send_and_verify(page, "小林", {"type": "sticker", "value": "续火花"})
+                    message = {"type": "sticker", "value": "续火花"}
+                    before, ids = submit_message(page, "小林", message)
+                    verify_after_reload(page, "小林", message, before, ids)
                     self.assertEqual({"new-message"}, sticker_message_ids(page))
             finally:
                 browser.close()
